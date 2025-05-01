@@ -580,7 +580,6 @@ class ArtManager(QMainWindow):
         art_id, name, path, artist, tags = item.data(Qt.UserRole)
         pix = QPixmap(path)
         self.current_image = pix.toImage()
-        QApplication.clipboard().setPixmap(pix)
         self.display_image(pix)
         self.current_art_id = art_id
         self.name_input.setText(name)
