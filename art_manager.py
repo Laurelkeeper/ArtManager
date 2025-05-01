@@ -7,7 +7,8 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton,
     QLineEdit, QListWidget, QListWidgetItem, QVBoxLayout,
     QHBoxLayout, QShortcut, QMessageBox, QSplitter,
-    QListView, QAbstractItemView, QMenu, QInputDialog
+    QListView, QAbstractItemView, QMenu, QInputDialog,
+    QSizePolicy
 )
 from PyQt5.QtGui import QPixmap, QKeySequence, QIcon
 from PyQt5.QtCore import Qt, QSize, QPoint, QThread, pyqtSignal
@@ -151,6 +152,8 @@ class ArtManager(QMainWindow):
         # Image preview
         self.image_label = QLabel("Paste or select an image")
         self.image_label.setAlignment(Qt.AlignCenter)
+        # allow the label to shrink below the pixmap’s native size:
+        self.image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         v.addWidget(self.image_label, stretch=1)
 
         # Metadata inputs
