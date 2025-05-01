@@ -8,9 +8,9 @@ from PyQt5.QtWidgets import (
     QLineEdit, QListWidget, QListWidgetItem, QVBoxLayout,
     QHBoxLayout, QShortcut, QMessageBox, QSplitter,
     QListView, QAbstractItemView, QMenu, QInputDialog,
-    QSizePolicy
+    QSizePolicy, QFileDialog
 )
-from PyQt5.QtGui import QPixmap, QKeySequence, QIcon
+from PyQt5.QtGui import QPixmap, QKeySequence, QIcon, QImage
 from PyQt5.QtCore import Qt, QSize, QPoint, QThread, pyqtSignal
 
 class SaveArtWorker(QThread):
@@ -29,13 +29,25 @@ class SaveArtWorker(QThread):
 
     def run(self):
         try:
-            import time, os, sqlite3
-            # 1) save PNG
+
+            # 1) save full-size PNG
             fname = f"art_{int(time.time())}.png"
             full  = os.path.join(self.image_dir, fname)
             self.image.save(full)
-            # 2) open its own DB connection
-            conn = sqlite3.connect(self.db_path)
+
+            # ‣ create thumbs folder if needed
+            thumb_dir = os.path.join(self.image_dir, "thumbs")
+            os.makedirs(thumb_dir, exist_ok=True)
+
+            # 2) generate & save 64×64 thumbnail
+            pix   = QPixmap.fromImage(self.image)
+            thumb = pix.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            thumb.save(os.path.join(thumb_dir, fname))
+
+            # 3) open its own DB connection
+            conn = sqlite3.connect(self.db_path, timeout=5)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=5000;")
             c    = conn.cursor()
             if self.existing:
                 art_id, old = self.existing
@@ -45,20 +57,81 @@ class SaveArtWorker(QThread):
                 )
                 try: os.remove(old)
                 except: pass
+                old_thumb = os.path.join(thumb_dir, os.path.basename(old))
+                try:
+                    os.remove(old_thumb)
+                except OSError:
+                    pass
             else:
                 c.execute(
                     "INSERT INTO artworks (name, filepath, artist, tags) VALUES (?, ?, ?, ?)",
                     (self.name, full, self.artist, ','.join(sorted(self.tags)))
                 )
                 art_id = c.lastrowid
+            
             for t in self.tags:
                 try: c.execute("INSERT INTO tags (tag) VALUES (?)", (t,))
                 except sqlite3.IntegrityError: pass
             conn.commit()
             conn.close()
+
+            # 4) emit finish
             self.finished.emit(art_id, full)
         except Exception as e:
             self.error.emit(str(e))
+
+class ImportFolderWorker(QThread):
+    finished = pyqtSignal()
+    error    = pyqtSignal(str)
+
+    def __init__(self, folder, image_dir, db_path):
+        super().__init__()
+        self.folder    = folder
+        self.image_dir = image_dir
+        self.db_path   = db_path
+
+    def run(self):
+        thumb_dir = os.path.join(self.image_dir, "thumbs")
+        os.makedirs(thumb_dir, exist_ok=True)
+
+        conn = sqlite3.connect(self.db_path, timeout=30)
+        try:
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=30000;")
+            c = conn.cursor()
+
+            for fname in os.listdir(self.folder):
+                src = os.path.join(self.folder, fname)
+                if not os.path.isfile(src):
+                    continue
+                ext = os.path.splitext(fname)[1].lower()
+                if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".gif"):
+                    continue
+
+                # 1) copy file
+                dst_name = f"art_{int(time.time())}_{fname}"
+                dst      = os.path.join(self.image_dir, dst_name)
+                shutil.copy2(src, dst)
+
+                # 2) generate & save thumbnail
+                pix   = QPixmap(dst)
+                thumb = pix.scaled(64, 64, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                thumb.save(os.path.join(thumb_dir, dst_name))
+
+                # 3) insert DB row
+                base = os.path.splitext(fname)[0]
+                c.execute(
+                    "INSERT INTO artworks (name, filepath, artist, tags) VALUES (?, ?, ?, ?)",
+                    (base, dst, "", "")
+                )
+
+            conn.commit()
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            conn.close()
+            self.finished.emit()
+
 
 class ArtManager(QMainWindow):
     def __init__(self):
@@ -126,7 +199,14 @@ class ArtManager(QMainWindow):
 
     def create_main_panel(self):
         widget = QWidget()
-        v = QVBoxLayout(widget)
+        main_layout = QVBoxLayout(widget)
+
+        # Vertical splitter: top = search+results, bottom = rest
+        splitter = QSplitter(Qt.Vertical)
+
+        # Top pane: search bar + results
+        top_pane = QWidget()
+        top_layout = QVBoxLayout(top_pane)
 
         # Search bar
         search_layout = QHBoxLayout()
@@ -137,7 +217,7 @@ class ArtManager(QMainWindow):
         search_btn.clicked.connect(self.search_art)
         search_layout.addWidget(self.search_input)
         search_layout.addWidget(search_btn)
-        v.addLayout(search_layout)
+        top_layout.addLayout(search_layout)
 
         # Results list
         self.results_list = QListWidget()
@@ -147,14 +227,20 @@ class ArtManager(QMainWindow):
         self.results_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.results_list.setDragDropMode(QAbstractItemView.NoDragDrop)
         self.results_list.itemClicked.connect(self.handle_result_click)
-        v.addWidget(self.results_list)
+        self.results_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.results_list.customContextMenuRequested.connect(self.on_results_context)
+        top_layout.addWidget(self.results_list)
+        splitter.addWidget(top_pane)
+
+        # Bottom pane: preview + metadata + buttons
+        bottom_pane = QWidget()
+        bottom_layout = QVBoxLayout(bottom_pane)
 
         # Image preview
         self.image_label = QLabel("Paste or select an image")
         self.image_label.setAlignment(Qt.AlignCenter)
-        # allow the label to shrink below the pixmap’s native size:
         self.image_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
-        v.addWidget(self.image_label, stretch=1)
+        bottom_layout.addWidget(self.image_label, stretch=1)
 
         # Metadata inputs
         form = QHBoxLayout()
@@ -164,19 +250,25 @@ class ArtManager(QMainWindow):
         self.artist_input.setPlaceholderText("Artist name")
         form.addWidget(self.name_input)
         form.addWidget(self.artist_input)
-        v.addLayout(form)
+        bottom_layout.addLayout(form)
 
         # Action buttons
         btns = QHBoxLayout()
         paste_btn = QPushButton("Paste Image"); paste_btn.clicked.connect(self.paste_image)
         copy_btn = QPushButton("Copy Image"); copy_btn.clicked.connect(self.copy_current)
-        self.save_btn  = QPushButton("Save")
-        self.save_btn.clicked.connect(self.save_art)
+        self.save_btn = QPushButton("Save"); self.save_btn.clicked.connect(self.save_art)
         delete_btn = QPushButton("Delete"); delete_btn.clicked.connect(self.delete_current)
-        for btn in (paste_btn, copy_btn, self.save_btn, delete_btn):
+        import_btn = QPushButton("Import Folder"); import_btn.clicked.connect(self.import_folder)
+        for btn in (paste_btn, copy_btn, self.save_btn, delete_btn, import_btn):
             btn.setFixedHeight(30)
             btns.addWidget(btn)
-        v.addLayout(btns)
+        bottom_layout.addLayout(btns)
+
+        splitter.addWidget(bottom_pane)
+        splitter.setStretchFactor(0, 2)
+        splitter.setStretchFactor(1, 3)
+
+        main_layout.addWidget(splitter)
         return widget
 
     def create_side_panel(self):
@@ -205,6 +297,35 @@ class ArtManager(QMainWindow):
 
         self.load_tags()
         return widget
+
+    def import_folder(self):
+        folder = QFileDialog.getExistingDirectory(self, "Select Folder to Import")
+        if not folder:
+            return
+
+        # disable UI while importing
+        self.save_btn.setEnabled(False)
+        self.statusBar().showMessage("Importing…")
+
+        # store as attribute so it isn't GC’d
+        self._import_worker = ImportFolderWorker(folder, self.image_dir, self.db_path)
+
+        # when done: refresh UI, re-enable button, delete the thread object
+        def on_done():
+            self.search_art()
+            self.statusBar().showMessage("Batch import complete", 2000)
+            self.save_btn.setEnabled(True)
+            self._import_worker.deleteLater()
+            self._import_worker = None
+
+        self._import_worker.finished.connect(on_done)
+        self._import_worker.error.connect(lambda msg: (
+            QMessageBox.critical(self, "Import Error", msg),
+            self.save_btn.setEnabled(True),
+            self._import_worker.deleteLater(),
+            setattr(self, '_import_worker', None)
+        ))
+        self._import_worker.start()
 
     def handle_result_click(self, item):
         art_id, name, path, artist, tags = item.data(Qt.UserRole)
@@ -412,7 +533,7 @@ class ArtManager(QMainWindow):
             tag_vals = [t.lower() for t in tags.split(',')] if tags else []
             # match if all terms present in any field
             if all(any(term in field for field in [name_val, artist_val] + tag_vals) for term in terms):
-                icon = QIcon(QPixmap(path).scaled(64,64,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+                icon = QIcon(path.replace("images", "images/thumbs", 1))
                 item = QListWidgetItem(icon, name or os.path.basename(path))
                 item.setData(Qt.UserRole, row)
                 self.results_list.addItem(item)
@@ -421,10 +542,39 @@ class ArtManager(QMainWindow):
             self.results_list.clear()
             for row in c.execute("SELECT id, name, filepath, artist, tags FROM artworks"):
                 art_id, name, path, artist, tags = row
-                icon = QIcon(QPixmap(path).scaled(64,64,Qt.KeepAspectRatio,Qt.SmoothTransformation))
+                icon = QIcon(path.replace("images", "images/thumbs", 1))
                 item = QListWidgetItem(icon, name or os.path.basename(path))
                 item.setData(Qt.UserRole, row)
                 self.results_list.addItem(item)
+
+    def on_results_context(self, pos):
+        # Map the click into an item
+        item = self.results_list.itemAt(pos)
+        if not item:
+            return
+        art_id, name, path, artist, tags = item.data(Qt.UserRole)
+
+        menu = QMenu()
+        rename = menu.addAction("Rename Image…")
+        action = menu.exec_(self.results_list.mapToGlobal(pos))
+        if action is rename:
+            new_name, ok = QInputDialog.getText(self, "Rename Image",
+                                                "New name:", text=name)
+            if not ok or not new_name.strip():
+                return
+            new_name = new_name.strip()
+            # 1) update DB
+            c = self.conn.cursor()
+            c.execute("UPDATE artworks SET name=? WHERE id=?", (new_name, art_id))
+            self.conn.commit()
+            # 2) reload search
+            self.search_art()
+            # 3) reload current item if active
+            print(self.name_input.text)
+            print(name)
+            if self.name_input.text() == name:
+                self.name_input.setText(new_name)
+            
 
     def open_art(self, item):
         art_id, name, path, artist, tags = item.data(Qt.UserRole)
@@ -460,6 +610,8 @@ class ArtManager(QMainWindow):
             pix = QPixmap.fromImage(img)
             self.display_image(pix)
             # update DB file for this art
+            thumb = pix.scaled(64,64,Qt.KeepAspectRatio,Qt.SmoothTransformation)
+            thumb.save(os.path.join(self.image_dir, "thumbs", fname))
             fname = f"art_{int(time.time())}.png"
             path = os.path.join(self.image_dir, fname)
             img.save(path)
