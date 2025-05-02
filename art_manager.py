@@ -52,8 +52,8 @@ class SaveArtWorker(QThread):
             if self.existing:
                 art_id, old = self.existing
                 c.execute(
-                    "UPDATE artworks SET filepath=?, artist=?, tags=?, timestamp=CURRENT_TIMESTAMP WHERE id=?",
-                    (full, self.artist, ','.join(sorted(self.tags)), art_id)
+                    "UPDATE artworks SET name=?, filepath=?, artist=?, tags=?, timestamp=CURRENT_TIMESTAMP WHERE id=?",
+                    (self.name, full, self.artist, ','.join(sorted(self.tags)), art_id)
                 )
                 try: os.remove(old)
                 except: pass
@@ -83,6 +83,7 @@ class SaveArtWorker(QThread):
 class ImportFolderWorker(QThread):
     finished = pyqtSignal(str)
     error    = pyqtSignal(str)
+    progress = pyqtSignal(str)
 
     def __init__(self, folder, image_dir, db_path):
         super().__init__()
@@ -102,6 +103,10 @@ class ImportFolderWorker(QThread):
 
             duplicates = []
             for fname in os.listdir(self.folder):
+                # emit progress before handling each file
+                self.progress.emit(fname)
+
+
                 src = os.path.join(self.folder, fname)
                 if not os.path.isfile(src):
                     continue
@@ -184,6 +189,7 @@ class ArtManager(QMainWindow):
         self.resize(1000, 600)
         # shortcuts
         QShortcut(QKeySequence.Paste, self).activated.connect(self.paste_image)
+        QShortcut(QKeySequence.Save, self).activated.connect(self.save_art)
         QShortcut(QKeySequence("Ctrl+Shift+X"), self).activated.connect(self.clear_all)
         QShortcut(QKeySequence.Copy, self).activated.connect(self.copy_current)
         QShortcut(QKeySequence("Ctrl+Shift+V"), self).activated.connect(self.replace_image)
@@ -324,6 +330,11 @@ class ArtManager(QMainWindow):
         # store as attribute so it isn't GC’d
         self._import_worker = ImportFolderWorker(folder, self.image_dir, self.db_path)
 
+        # show filename in status bar as each one comes in
+        self._import_worker.progress.connect(
+            lambda fname: self.statusBar().showMessage(f"Importing {fname}…")
+        )
+
         # when done: refresh UI, re-enable button, delete the thread object
         def on_done(msg: str):
             self.search_art()
@@ -463,22 +474,58 @@ class ArtManager(QMainWindow):
         if not self.current_image:
             self.statusBar().showMessage("No image to save", 2000)
             return
-        # gather form data
-        name     = self.name_input.text().strip()
+
+        new_name = self.name_input.text().strip()
         artist   = self.artist_input.text().strip()
         tags     = set(self.current_tags)
-        # look up existing record
-        c = self.conn.cursor()
-        existing = None
-        if name:
-            row = c.execute("SELECT id, filepath FROM artworks WHERE name=?", (name,)).fetchone()
-            if row: existing = row
 
-        # disable UI, spawn worker
+        # Determine existing record context
+        existing = None
+        old_path = None
+
+        if self.current_art_id:
+            # fetch old name & path
+            row = self.conn.cursor().execute(
+                "SELECT name, filepath FROM artworks WHERE id=?", 
+                (self.current_art_id,)
+            ).fetchone()
+            if row:
+                old_name, old_path = row
+                # if the user changed the name, ask whether to rename or save-as-new
+                if new_name and new_name != old_name:
+                    dlg = QMessageBox(self)
+                    dlg.setWindowTitle("Name changed")
+                    dlg.setText(f"You renamed '{old_name}' to '{new_name}'. \nRename the existing image, or save a new one under '{new_name}'?")
+                    btn_rename = dlg.addButton("Rename", QMessageBox.AcceptRole)
+                    btn_new    = dlg.addButton("Save as New", QMessageBox.RejectRole)
+                    btn_cancel = dlg.addButton(QMessageBox.Cancel)
+                    dlg.setDefaultButton(btn_rename)
+                    dlg.exec_()
+
+                    clicked = dlg.clickedButton()
+                    if clicked is btn_cancel:
+                        return
+                    elif clicked is btn_rename:
+                        existing = (self.current_art_id, old_path)
+                    else:  # Save as New
+                        existing = None
+                else:
+                    # name unchanged: update in-place
+                    existing = (self.current_art_id, old_path)
+
+        # If brand‑new image (no current_art_id), check if name collides to overwrite
+        if not existing and new_name:
+            row = self.conn.cursor().execute(
+                "SELECT id, filepath FROM artworks WHERE name=?", (new_name,)
+            ).fetchone()
+            if row:
+                existing = row
+
+        # Spawn the worker to handle save/update/rename in one go
         self.save_btn.setEnabled(False)
         self._save_thread = SaveArtWorker(
             image     = self.current_image,
-            name      = name,
+            name      = new_name,
             artist    = artist,
             tags      = tags,
             image_dir = self.image_dir,
@@ -488,6 +535,7 @@ class ArtManager(QMainWindow):
         self._save_thread.finished.connect(self.on_save_finished)
         self._save_thread.error.connect(self.on_save_error)
         self._save_thread.start()
+
 
     def on_save_finished(self, art_id, path):
         self.current_art_id = art_id
@@ -601,6 +649,7 @@ class ArtManager(QMainWindow):
         self.current_image = pix.toImage()
         self.display_image(pix)
         self.current_art_id = art_id
+        self.original_name  = name
         self.name_input.setText(name)
         self.artist_input.setText(artist)
         self.current_tags = set(tags.split(',')) if tags else set()
