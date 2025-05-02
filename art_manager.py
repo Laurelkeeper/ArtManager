@@ -81,7 +81,7 @@ class SaveArtWorker(QThread):
             self.error.emit(str(e))
 
 class ImportFolderWorker(QThread):
-    finished = pyqtSignal()
+    finished = pyqtSignal(str)
     error    = pyqtSignal(str)
 
     def __init__(self, folder, image_dir, db_path):
@@ -100,6 +100,7 @@ class ImportFolderWorker(QThread):
             conn.execute("PRAGMA busy_timeout=30000;")
             c = conn.cursor()
 
+            duplicates = []
             for fname in os.listdir(self.folder):
                 src = os.path.join(self.folder, fname)
                 if not os.path.isfile(src):
@@ -120,17 +121,30 @@ class ImportFolderWorker(QThread):
 
                 # 3) insert DB row
                 base = os.path.splitext(fname)[0]
-                c.execute(
-                    "INSERT INTO artworks (name, filepath, artist, tags) VALUES (?, ?, ?, ?)",
-                    (base, dst, "", "")
-                )
+                try:
+                    c.execute(
+                        "INSERT INTO artworks (name, filepath, artist, tags) VALUES (?, ?, ?, ?)",
+                        (base, dst, "", "")
+                    )
+                except sqlite3.IntegrityError:
+                    # name already exists
+                    duplicates.append(base)
+
 
             conn.commit()
+
+            msg = None
+            if duplicates:
+                msg = (
+                  f"Skipped {len(duplicates)} image(s) with duplicate name(s): "
+                  + ", ".join(duplicates)
+                )
+
         except Exception as e:
             self.error.emit(str(e))
         finally:
             conn.close()
-            self.finished.emit()
+            self.finished.emit(msg)
 
 
 class ArtManager(QMainWindow):
@@ -311,12 +325,17 @@ class ArtManager(QMainWindow):
         self._import_worker = ImportFolderWorker(folder, self.image_dir, self.db_path)
 
         # when done: refresh UI, re-enable button, delete the thread object
-        def on_done():
+        def on_done(msg: str):
             self.search_art()
             self.statusBar().showMessage("Batch import complete", 2000)
+            if msg:
+                QMessageBox.information(self, "Import Complete", msg)
+            else:
+                self.statusBar().showMessage("Batch import complete", 2000)
             self.save_btn.setEnabled(True)
             self._import_worker.deleteLater()
             self._import_worker = None
+
 
         self._import_worker.finished.connect(on_done)
         self._import_worker.error.connect(lambda msg: (
@@ -429,7 +448,7 @@ class ArtManager(QMainWindow):
     def paste_image(self):
         cb = QApplication.clipboard()
         if cb.mimeData().hasImage():
-            img = cb.image()
+            img = cb.image()    
             self.current_image = img
             pix = QPixmap.fromImage(img)
             self.display_image(pix)
