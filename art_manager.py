@@ -677,9 +677,9 @@ class ArtManager(QMainWindow):
             pix = QPixmap.fromImage(img)
             self.display_image(pix)
             # update DB file for this art
+            fname = f"art_{int(time.time())}.png"
             thumb = pix.scaled(64,64,Qt.KeepAspectRatio,Qt.SmoothTransformation)
             thumb.save(os.path.join(self.image_dir, "thumbs", fname))
-            fname = f"art_{int(time.time())}.png"
             path = os.path.join(self.image_dir, fname)
             img.save(path)
             c = self.conn.cursor()
@@ -687,8 +687,14 @@ class ArtManager(QMainWindow):
             old = c.execute("SELECT filepath FROM artworks WHERE id=?", (self.current_art_id,)).fetchone()[0]
             c.execute("UPDATE artworks SET filepath=?, timestamp=CURRENT_TIMESTAMP WHERE id=?", (path, self.current_art_id))
             self.conn.commit()
-            try: os.remove(old)
+
+            try: 
+
+                os.remove(old)
+
+                os.remove(old.rpartition("\\")[0]+"\\thumbs\\"+old.rpartition("\\")[2])
             except: pass
+            self.search_art()
         else:
             self.statusBar().showMessage("No image in clipboard to replace", 2000)
 
